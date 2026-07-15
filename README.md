@@ -9,9 +9,13 @@ This repo is a user guild for my project.
 ```bash
 git clone https://github.com/你的用户名/SAC-Diffusion.git
 cd SAC-Diffusion
-2. download extracted demontrations
 ```
+2. download extracted demontrations
+
 ```bash
+cd demonstrations
+git
+```
 
 3. Download the CALVIN dataset(Optional)
 
