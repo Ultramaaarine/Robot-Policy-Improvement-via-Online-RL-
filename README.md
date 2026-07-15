@@ -43,7 +43,7 @@ pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
 7. Install other packages
 ```bash
 pip install -r requirements.txt
-
+```
 8. Run training script
   run DDPM training
 ```bash
