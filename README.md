@@ -17,10 +17,15 @@ cd demonstrations
 git
 ```
 
-3. Download the CALVIN dataset(Optional)
+3. Download the CALVIN dataset (Optional)
 
 ```bash
 cd dataset
 git clone --recurse-submodules https://github.com/mees/calvin.git
 $ export CALVIN_ROOT=$(pwd)/calvin
+```
+4. create conda environment
+```bash
+conda python = 3.12
+```
 
