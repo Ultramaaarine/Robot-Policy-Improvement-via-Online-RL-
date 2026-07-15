@@ -16,7 +16,8 @@ cd SAC_Diffusion
 ```bash
 cd dataset
 git clone --recurse-submodules https://github.com/mees/calvin.git
-$ export CALVIN_ROOT=$(pwd)/calvin
+cd $CALVIN_ROOT/dataset
+sh download_data.sh D | ABC | ABCD | debug
 ```
 3. create conda environment
 ```bash
