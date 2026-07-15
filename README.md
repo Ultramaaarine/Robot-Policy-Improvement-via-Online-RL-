@@ -3,10 +3,10 @@ This project presents a reinforcement-learning-enhanced diffusion policy framewo
 This repo is a user guild for my project. 
 
 # Quick Start
-# Installation
 
-Clone the repository:
+1. Clone the repository:
 
 ```bash
 git clone https://github.com/你的用户名/SAC-Diffusion.git
 cd SAC-Diffusion
+
