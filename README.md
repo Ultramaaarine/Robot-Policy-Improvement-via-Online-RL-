@@ -11,7 +11,9 @@ https://github.com/Ultramaaarine/Robot-Policy-Improvement-via-Online-RL-.git
 cd SAC_Diffusion
 ```
 
-2. Download the CALVIN dataset (Optional)
+2. Download the CALVIN dataset
+
+    Please note that the dataset requires significant storage space and may take a considerable amount of time to download. For more information, visit the [CALVIN repository](https://github.com/mees/calvin).
 
 ```bash
 cd dataset
