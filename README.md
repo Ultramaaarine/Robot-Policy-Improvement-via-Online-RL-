@@ -45,11 +45,13 @@ pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
 pip install -r requirements.txt
 ```
 8. Run training script
-  run DDPM training
+
+run DDPM training
 ```bash
 python sac_diffusion/workspaces/ddpm_critic_training.py
 ```
-  run DDIM training
+
+run DDIM training
 ```bash
 python sac_diffusion/workspaces/ddim_critic_training.py
 ```
