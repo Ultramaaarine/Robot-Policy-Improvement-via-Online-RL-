@@ -9,4 +9,14 @@ This repo is a user guild for my project.
 ```bash
 git clone https://github.com/你的用户名/SAC-Diffusion.git
 cd SAC-Diffusion
+2. download extracted demontrations
+```
+```bash
+
+3. Download the CALVIN dataset(Optional)
+
+```bash
+cd dataset
+git clone --recurse-submodules https://github.com/mees/calvin.git
+$ export CALVIN_ROOT=$(pwd)/calvin
 
