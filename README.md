@@ -10,29 +10,23 @@ This repo is tested on a 24.04 Unbuntu machine
 git clone https://github.com/你的用户名/SAC-Diffusion.git
 cd SAC_Diffusion
 ```
-2. download extracted demontrations
 
-```bash
-cd demonstrations
-git
-```
-
-3. Download the CALVIN dataset (Optional)
+2. Download the CALVIN dataset (Optional)
 
 ```bash
 cd dataset
 git clone --recurse-submodules https://github.com/mees/calvin.git
 $ export CALVIN_ROOT=$(pwd)/calvin
 ```
-4. create conda environment
+3. create conda environment
 ```bash
 conda create -n sacdiff_venv python = 3.12
 ```
-5. Activate conda environment
+4. Activate conda environment
 ```bash
 conda activate sacdiff_venv
 ```
-6. Install pytorch
+5. Install pytorch
 
   Attention: if you are in root path "SAC_Diffusion",skip command "cd ..". Make Sure you are in root path!!!
 ```bash
@@ -40,11 +34,11 @@ cd ..
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
   --index-url https://download.pytorch.org/whl/cu124
 ```
-7. Install other packages
+6. Install other packages
 ```bash
 pip install -r requirements.txt
 ```
-8. Run training script
+7. Run training script
 
   run DDPM training
 ```bash
