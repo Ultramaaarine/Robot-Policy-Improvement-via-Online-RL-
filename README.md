@@ -15,6 +15,8 @@ cd SAC_Diffusion
 
     Please note that the dataset requires significant storage space and may take a considerable amount of time to download. For more information, visit the [CALVIN repository](https://github.com/mees/calvin).
 
+   You don't need to perfrom every steps in [CALVIN repository] just download the dataset to dataset folder.
+
 ```bash
 cd dataset
 git clone --recurse-submodules https://github.com/mees/calvin.git
