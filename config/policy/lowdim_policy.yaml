@@ -1,0 +1,25 @@
+
+ _target_: sac_diffusion.policy.lowdim_policy.LowdimPolicy
+ model: 
+  _target_: sac_diffusion.models.Diffusion_Unet.Lowdim_Unet
+  dim_in: null            
+  pos_emb_dim: 256
+  diffusion_input_dim: 256
+  cond_dim: 6
+  enable_cond: True
+  enable_visual_obs: False
+  
+  low_dim_obs_encoder_out_dim: 128
+  visual_obs_feature_dim: null
+  use_visual_obs_only: False
+  combine_obs: False
+  action_dim: 3 
+ mode: "gaussian"
+ action_horizon: 16
+ num_sampling_steps: 50
+ training_timesteps: 1000
+ beta_start: 0.0001
+ beta_end: 0.02
+ beta_schedule: "linear"
+ prediction_type: "epsilon" # must be "epsilon", "sample" or "v_prediction"
+ error_scale: 0

@@ -1,0 +1,10 @@
+_target_: sac_diffusion.models.SAC_Model.critic.DoubleQNetwork
+
+cond_output_dim: 128
+gru_num_layers: 3
+mlp_middle_dim: 256
+mlp_output_dim: 1
+obs_type: "lowdim_obs"
+action_dim: 3
+cond_dim: 3
+

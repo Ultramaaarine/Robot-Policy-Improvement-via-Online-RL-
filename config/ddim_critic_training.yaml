@@ -1,0 +1,127 @@
+defaults:
+  - setup
+  - env: calvin_scene_D
+  - datamodule: diffusion_model_offline_training
+  - skill: calvin_open_drawer
+  - critic_network: low_dim_critic_network
+  - value_network: value_network
+  
+task_name: "calvin_open_drawer"
+name: "name"
+exp_name: "exp"
+seed: 42
+model_save_dir: /home/${oc.env:USER}/SAC_Diffusion/models/ddim_models
+heuristic_sample: 8
+training:
+  device: "cuda:0"
+  gradient_accumulate_every: 1
+  use_ema: False #虽然不用但还是要加上配置
+  #lr_scheduler
+  lr_scheduler: cosine
+  lr_warmup_steps: 100
+  reach_end_t: 32
+  align_end_t: 36
+  num_epochs: 420
+  max_train_steps: 16
+  max_val_steps: 10
+  training_critic_every: 1
+  online_critic_steps: 100
+  tqdm_interval_sec: 1.0
+  val_every: 10
+  batch_size: 8
+  save_every_epoch: 100
+  rollout_after: 420 # 400 epochs is enough
+  rollout_every: 10
+  obs_hor_len: 8
+  act_hor_len: 8
+  horizon: 8
+  furture_offset: 8
+  heu_epoch_num: 50
+  heu_val_every: 10
+  rollout_times: 8
+  err_scale: 1
+  reward_w_env: 1.0
+  reward_w_demo: 0.0
+  reward_w_goal: 1.0
+  expectile_tau: 0.8
+  critic_gamma: 0.5
+  max_online_cycle: 10
+
+
+policy:
+ _target_: sac_diffusion.policy.hybrid_transformer_policy.HybridPolicy
+ model: 
+  _target_: sac_diffusion.models.transformer_for_diffusion.DiffusionTransformer
+  cond_dim: 3 
+  action_dim: 3
+  enable_visual_obs: True
+  low_dim_obs_encoder_out_dim: 128
+  use_visual_obs_only: False
+  diffusion_input_dim: 128
+  visual_obs_feature_dim: 128 #No null !!
+  combine_obs: True
+  d_model: 128
+  nhead: 4
+  num_layers: 4
+  dim_feedforward: 256
+  dropout: 0.1
+  max_len: 64
+ mode: "gaussian"
+ action_horizon: 8
+ num_sampling_steps: 3
+ training_timesteps: 1000
+ beta_start: 0.0001
+ beta_end: 0.02
+ beta_schedule: "linear"
+ prediction_type: "epsilon" # must be "epsilon", "sample" or "v_prediction"
+ error_scale: 1000
+ lambda_stage: 0.2
+
+#ema model
+ema:
+ _target_: sac_diffusion.models.exponential_moving_average.EMAModel
+ update_after_step: 0
+ gamma: 1.0
+ power: 0.75
+ min_value: 0.0
+ max_value: 0.999
+
+ 
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.0001
+  betas: [0.95,0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+  
+critic_optimizer:
+ _target_: torch.optim.Adam
+ lr: 0.0001
+ betas: [0.9, 0.999]
+ weight_decay: 0
+ 
+v_net_optimizer:
+ _target_: torch.optim.Adam
+ lr: 0.0001
+ betas: [0.9, 0.999]
+ weight_decay: 0
+ 
+replay_buffer:
+  _target_: sac_diffusion.models.replay_buffer.ReplayBuffer
+  capacity: 200000
+  obs_shape: [3]
+  action_dim: 3
+  device: "cuda:0"
+  
+
+logging:
+  project: diffusion_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+

@@ -1,0 +1,7 @@
+defaults:
+- setup
+name: calvin_open_drawer
+state_type: 'pos'
+n_components: 3
+
+T_obj_gripper: [-0.10,  0.07,  0.15] # bias 

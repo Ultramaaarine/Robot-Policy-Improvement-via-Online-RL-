@@ -1,0 +1,4 @@
+defaults:
+  - cameras@tactile: tactile
+  - cameras@gripper: gripper
+

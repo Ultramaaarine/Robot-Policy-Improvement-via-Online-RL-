@@ -1,0 +1,24 @@
+
+defaults:
+- policy: lowdim_policy # obs_policy, mixed_policy
+#- sac: default
+#- encoder: default
+#- kp_mock: default
+- critic_network: low_dim_critic_network
+- value_network: value_network
+- datamodule: diffusion_model_offline_training
+- skill: calvin_close_drawer #calvin_open_drawer
+- env: calvin_scene_D
+#- agent: sac_gmm_calvin
+
+- _self_
+
+- override hydra/job_logging: colorlog     #告诉 Hydra 这是强制覆盖已有同名配置组的选择，而不是追加或合并。可避免“该组已被指定”的报错。
+- override hydra/hydra_logging: colorlog   #hydra/job_logging: colorlog：把自己的程序日志（Python logging 的 root/模块日志）
+                                           #使用的配置组，切换为名为 colorlog 的预置方案。运行时终端日志会使用带颜色的格式（不同级别不同颜色、包含时间/级别/模块等），更易读。
+
+goal_centered: true
+obs_space:
+ - pos
+ - joints
+ - gripper 

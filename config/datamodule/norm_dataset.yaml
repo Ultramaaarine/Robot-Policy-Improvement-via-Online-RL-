@@ -1,0 +1,12 @@
+defaults:
+- training_dataset: diffusion_offline_training
+
+
+_target_: sac_diffusion.datasets.skill_datamodule.SkillDataModule #前后带下划线的是Hydra的保留控制键。
+                                                                  #_target_告诉 Hydra “该实例化谁
+_recursive_: false
+
+batch_size: 32
+num_workers: 1
+step_len: 1
+skill: ${skill} # 插值，在 defualts引入的其他配置文件里能找到

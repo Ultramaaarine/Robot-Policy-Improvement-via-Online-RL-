@@ -1,0 +1,17 @@
+seed: 42
+slurm: false
+device: cuda:0
+
+root: /mnt/data/SAC_Diffusion
+log_dir: ${root}/logs
+demos_dir: ${root}/demonstrations
+exp_dir: null 
+critic_ckpt_dir: ${root}/models/ddpm_models
+diffusion_ckpt_dir: ${root}/models/ddpm_models/epoch_0001.pt
+developer: ${oc.env:USER}
+comment: ""
+
+#Environment params
+render: false
+record: false
+show_gui: True

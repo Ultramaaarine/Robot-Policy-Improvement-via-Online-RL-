@@ -1,0 +1,11 @@
+_target_: sac_diffusion.datasets.calvin_critic_offline_dataset.CalvinCriticOfflineDataset
+skill: ${skill}
+goal_centered: True
+flatten: True
+demos_dir: ${demos_dir}
+
+data_type: "training"
+normalize: True
+is_quaternion: False
+use_visual_obs: False
+mode: "gaussian"
