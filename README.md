@@ -56,5 +56,11 @@ python sac_diffusion/workspaces/ddpm_critic_training.py
 python sac_diffusion/workspaces/ddim_critic_training.py
 ```
 # Demon Videos
+Open drawer
+
 https://github.com/user-attachments/assets/1455f7da-cd90-4ac9-a19d-2e2dcca8fdc7
+
+Close drawer
+
+https://github.com/Ultramaaarine/Robot-Policy-Improvement-via-Online-RL-/issues/3#issue-4905263514
 
