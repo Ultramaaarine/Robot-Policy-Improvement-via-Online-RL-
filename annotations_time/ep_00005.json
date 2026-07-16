@@ -1,0 +1,18 @@
+{
+  "episode_idx": 5,
+  "episode_len": 63,
+  "annotations": [
+    {
+      "episode_idx": 5,
+      "t": 46,
+      "progress": 0.7419354838709677,
+      "label": 1
+    },
+    {
+      "episode_idx": 5,
+      "t": 63,
+      "progress": 1.0,
+      "label": 2
+    }
+  ]
+}
