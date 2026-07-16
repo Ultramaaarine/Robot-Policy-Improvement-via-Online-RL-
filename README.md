@@ -55,4 +55,6 @@ python sac_diffusion/workspaces/ddpm_critic_training.py
 ```bash
 python sac_diffusion/workspaces/ddim_critic_training.py
 ```
+# Demon Videos
+https://github.com/user-attachments/assets/1455f7da-cd90-4ac9-a19d-2e2dcca8fdc7
 
