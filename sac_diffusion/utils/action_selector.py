@@ -1,4 +1,4 @@
-```python
+
 import torch
 import torch.nn.functional as F
 from typing import Optional
@@ -94,4 +94,4 @@ def select_action(
         selected_action = action_seq[selected_idx]
 
     return selected_action, selected_idx, scores, probs
-```
+
