@@ -126,3 +126,802 @@ class TrainDiffusionWorkspace(BaseWorkspace):
         )
         # Create rollout environment and read the environment-provided goal position.
         self.rollout_env = make_env(cfg=self.cfg.env, skill=self.cfg.skill)
+        self.rollout_env.reset()
+        self.env_goal_pos = self.rollout_env.gt_keypoint
+        self.improve_step = 0
+        self.critic_step = 0
+
+    # Entry point for one complete training run.
+    def run(self):
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_dir = Path(__file__).parent.parent.parent.joinpath(
+            "diffusion model offline training log", run_id
+        )
+        self.writer = SummaryWriter(log_dir=str(self.log_dir))
+
+        self._training_diffusion()
+
+    # Save statistics of the offline dataset action distribution for later analysis.
+    def _save_dataset_action_stats(self, training_dataset, out_dir: Path):
+        if hasattr(training_dataset, "action"):
+            a = training_dataset.action
+            if isinstance(a, torch.Tensor):
+                a = a.detach().cpu().numpy()
+            a = np.asarray(a)
+            return save_array_stats(a, out_dir, prefix="dataset_actions")
+
+        all_actions = []
+        for i in range(len(training_dataset)):
+            sample = training_dataset[i]
+            act = sample["action"]
+            if isinstance(act, torch.Tensor):
+                act = act.detach().cpu().numpy()
+            all_actions.append(act)
+        a = np.stack(all_actions, axis=0)
+        return save_array_stats(a, out_dir, prefix="dataset_actions")
+
+    # Combine environment reward, demonstration deviation, and goal distance into a shaped reward.
+    def _compute_shaped_reward(self, reward, demo_dist, goal_dist):
+        w_env = float(getattr(self.cfg.training, "reward_w_env", 0.3))
+        w_demo = float(getattr(self.cfg.training, "reward_w_demo", 0.3))
+        w_goal = float(getattr(self.cfg.training, "reward_w_goal", 0.4))
+        shaped_reward = torch.tensor(w_env * reward - w_demo * demo_dist - w_goal * goal_dist,dtype=torch.float32,device=self.device)
+        return shaped_reward
+
+    # Perform one critic/value update from a sliding-window batch.
+    # The critic uses TD targets, while the value network is trained with expectile regression.
+    def _critic_train_step_from_window(self, critic_window):
+        cond_t = critic_window["cond_t"]
+        cond = critic_window["cond_t"]["cond"]
+
+        # Extract current/next observations, action window, reward, and termination flags.
+        obs = cond["pos"].to(self.device)
+        obs_idx = cond_t["obs_idx"]
+        critic_action = critic_window["act_window"].to(self.device,dtype = torch.float32)
+        reward = critic_window["reward_window"].to(self.device, dtype = torch.float32)
+        done = critic_window["done_window"].to(self.device)
+        next_obs = cond["next_pos"].to(self.device)
+
+        # Compute demonstration deviation and goal-distance terms used in reward shaping.
+        demo_dist = ((cond["stage_goal_pos"].to(self.device) - obs) ** 2).sum(dim=-1, keepdim=True) # zero in offline, in online, build this with obs_hist and eef pos after step env eef pos1,eef pos2 from deque form a seq, compare  with obs pos seq from demo
+        goal_dist = cond["goal_dist"].to(self.device)
+
+
+        # Build the final shaped reward used for critic training.
+        shaped_reward = self._compute_shaped_reward(reward, demo_dist, goal_dist)
+   
+        # Assemble normalized low-dimensional conditions for current and next states.
+        n_cond, next_n_cond, visual_cond, action_mask, stage_out, next_stage_out = assemble_conditions(cond_t=cond_t,
+                                                                            cond_norm_params=self.cond_norm_param_dict,
+                                                                            batch_size=self.batch_size, device=self.device, error_scale=1000,
+                                                                            pull_start_t=36, 
+                                                                            build_action_mask=False)
+
+        # Build TD target using the next-state value estimate.
+        with torch.no_grad():
+            v_next = self.v_net(visual_obs=None, low_dim_obs=next_n_cond)
+            gamma = self.cfg.training.critic_gamma
+            gamma = torch.tensor(float(gamma),device=self.device,dtype = torch.float32) # do not directly read from cfg, convert it to torch.float32 
+            one = torch.tensor(1.0, device=self.device, dtype=torch.float32)
+            q_target = shaped_reward + gamma * (one - done) * v_next
+
+        # Evaluate both Q networks on the current state-action sequence.
+        q1, q2 = self.critic_network(state=n_cond, visual_obs=None, action=critic_action) # seq q value [B,T,1]
+
+        # Train Double-Q critic with MSE against the TD target.
+        critic_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+
+        self.critic_optimizer.zero_grad()
+
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        step_log = {
+            #"obs_idx":obs_idx,
+            "critic_loss":critic_loss,
+            "step_reward_q1":q1, # [B,T,1]
+            "step_reward_q2":q2,
+            "mean_q1":torch.mean(q1,dim=1), # seq_wise mean [B,1]
+            "mean_q2":torch.mean(q2,dim = 1)
+        }
+        logger.info(step_log)
+        # Recompute detached Q estimates for value-network training.
+        with torch.no_grad():
+            q1_detach, q2_detach = self.critic_network(state=n_cond, visual_obs=None, action=critic_action)
+            q_detach = torch.min(q1_detach, q2_detach)
+
+        # Train the value network toward Q using asymmetric expectile regression.
+        v_value = self.v_net(visual_obs=None, low_dim_obs=n_cond)
+        diff = q_detach - v_value
+
+        tau = float(self.cfg.training.expectile_tau)
+        weight = torch.where(
+            diff > 0,
+            torch.full_like(diff, tau),
+            torch.full_like(diff, 1.0 - tau),
+        )
+        v_loss = torch.mean(weight * (diff ** 2))
+
+        self.v_net_optimizer.zero_grad()
+        v_loss.backward()
+        self.v_net_optimizer.step()
+
+        return {
+            "critic_loss": float(critic_loss.item()),
+            "v_loss": float(v_loss.item()),
+            "q_mean": float(q_detach.mean().item()),
+            "v_mean": float(v_value.mean().item()),
+            "reward_mean": float(shaped_reward.mean().item()),
+            "q_target_mean": float(q_target.mean().item()),
+            "q_target_std": float(q_target.std().item()),
+            "q_target_max": float(q_target.max().item()),
+            "q_target_min": float(q_target.min().item()),
+            "reward_std": float(shaped_reward.std().item()),
+            "reward_max": float(shaped_reward.max().item()),
+            "reward_min": float(shaped_reward.min().item()),
+        }
+
+    # Offline diffusion-policy training loop followed by online rollout,
+    # critic learning, and advantage-weighted policy improvement.
+    def _training_diffusion(self):
+        self.critic_network.eval()
+        self.v_net.eval()
+
+        cfg = copy.deepcopy(self.cfg)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(tag)s] %(message)s"
+        )
+
+        print(f"length of training_dataset: {len(self.training_dataset)}")
+
+        # Learning-rate scheduler with warmup over the full offline training horizon.
+        lr_scheduler = get_scheduler(
+            cfg.training.lr_scheduler,
+            optimizer=self.optimizer,
+            num_warmup_steps=cfg.training.lr_warmup_steps,
+            num_training_steps=(len(self.training_dataloader) * cfg.training.num_epochs)
+            // cfg.training.gradient_accumulate_every,
+            last_epoch=self.global_step - 1
+        )
+
+        # Fit normalization statistics for condition features from offline data.
+        self.cond_norm_param_dict = fit_cond_normalizer(
+            training_dataloader=self.training_dataloader,
+            env_goal_pos=self.rollout_env.gt_keypoint,
+            cfg=self.cfg,
+        )
+
+        # Optional exponential moving average model.
+        ema = None
+        if cfg.training.use_ema:
+            ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
+
+        # Move policy, EMA model, and optimizer state to the training device.
+        self.diffusion_model = self.diffusion_model.to(self.device)
+        if self.ema_model is not None:
+            self.ema_model.to(self.device)
+        self.optimizer = optimizer_to(self.optimizer, device=self.device)
+
+        # Save baseline action statistics for debugging and comparison.
+        analysis_dir = Path(self.log_dir) / "action_analysis"
+        ds_stats = self._save_dataset_action_stats(self.training_dataset, analysis_dir)
+
+        np.random.seed(cfg.seed + 1234)
+
+        # Prepare checkpoint output directory.
+        model_path = Path(self.cfg.model_save_dir)
+        os.makedirs(model_path, exist_ok=True)
+
+        # Main offline diffusion training loop.
+        for epoch_idx in range(cfg.training.num_epochs):
+            train_losses = []
+            self.diffusion_model.train()
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with tqdm.tqdm(
+                self.training_dataloader,
+                desc=f"Training Epoch {epoch_idx + 1}",
+                mininterval=1.0
+            ) as tepoch:
+                for batch_idx, batch in enumerate(tepoch):
+                    # Build one observation-history / future-action training window.
+                    window = build_sliding_window_batch(
+                        cfg=self.cfg,
+                        batch=batch,
+                        env_goal_pos=self.env_goal_pos,
+                        horizon=int(getattr(self.cfg.training, "horizon", 16)),
+                    )
+
+                    action = window["act_window"].to(self.device)
+                    cond = window["cond_t"]
+
+                    # Compute standard diffusion training loss without improvement weights.
+                    raw_loss = self.diffusion_model.compute_loss(
+                        action,
+                        cond,
+                        action_norm_params=self.action_norm_params,
+                        cond_norm_params=self.cond_norm_param_dict,
+                        improve=False
+                    )
+
+                    # Support gradient accumulation across multiple minibatches.
+                    loss = raw_loss / cfg.training.gradient_accumulate_every
+                    loss.backward()
+
+                    raw_loss_cpu = float(raw_loss.detach().item())
+
+                    is_last_batch = (batch_idx + 1) == len(self.training_dataloader)
+                    do_step = ((batch_idx + 1) % cfg.training.gradient_accumulate_every) == 0 or is_last_batch
+
+                    # Apply optimizer step, LR update, and optional EMA update.
+                    if do_step:
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+                        lr_scheduler.step()
+
+                        if cfg.training.use_ema:
+                            ema.step(self.diffusion_model)
+
+                        self.global_step += 1
+                        self.writer.add_scalar("training/loss", raw_loss_cpu, global_step=epoch_idx+1)
+                        self.writer.add_scalar("training/lr", lr_scheduler.get_last_lr()[0], epoch_idx+1)
+
+                        train_losses.append(raw_loss_cpu)
+
+                        logger.info(
+                            "step=%d epoch=%d loss=%.6f lr=%.6f",
+                            self.global_step,
+                            self.epoch,
+                            raw_loss_cpu,
+                            lr_scheduler.get_last_lr()[0],
+                            extra={"tag": "Diffusion training"}
+                        )
+
+                    # if (cfg.training.max_train_steps is not None) and batch_idx >= (cfg.training.max_train_steps - 1):
+                    #     break
+
+            # Compute and log mean training loss for the epoch.
+            train_loss = float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0
+            self.writer.add_scalar("training/epoch_loss", train_loss, global_step=epoch_idx+1)
+
+            self.epoch += 1
+
+            # Periodically evaluate diffusion loss at several fixed trajectory timesteps.
+            # ---------- validation ----------
+            if (self.epoch % cfg.training.val_every) == 0:
+                self.diffusion_model.eval()
+                with torch.no_grad():
+                    t_list = [8, 16, 24, 32, 40, 48, 56]
+                    val_losses = []
+
+                    with tqdm.tqdm(
+                        self.validation_dataloader,
+                        desc=f"Validation epoch {self.epoch}",
+                        leave=False,
+                        mininterval=1.0
+                    ) as tepoch:
+                        for batch_idx, batch in enumerate(tepoch):
+                            for t in t_list:
+                                val_window = build_sliding_window_batch(
+                                    cfg=self.cfg,
+                                    batch=batch,
+                                    t=t,
+                                    env_goal_pos=self.env_goal_pos,
+                                    horizon=int(getattr(self.cfg.training, "horizon", 16))
+                                )
+                                val_action = val_window["act_window"].to(self.device)
+                                val_cond = val_window["cond_t"]
+
+                                val_loss = self.diffusion_model.compute_loss(
+                                    action=val_action,
+                                    cond=val_cond,
+                                    action_norm_params=self.action_norm_params,
+                                    cond_norm_params=self.cond_norm_param_dict,
+                                    improve=False,
+                                )
+                                val_losses.append(val_loss.item())
+
+                            # if (cfg.training.max_val_steps is not None
+                            #         and batch_idx >= (cfg.training.max_val_steps - 1)):
+                            #     break
+
+                    if len(val_losses) > 0:
+                        val_loss = float(np.mean(val_losses))
+                        self.writer.add_scalar("validation/loss", val_loss, global_step=epoch_idx+1)
+
+                self.diffusion_model.train()
+
+            # Periodically save diffusion-policy checkpoints.
+            # ---------- save checkpoint ----------
+            if (self.epoch % cfg.training.save_every_epoch) == 0:
+                ckpt = {
+                    "model": self.diffusion_model.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "global_step": self.global_step,
+                    "lr_scheduler": lr_scheduler.state_dict()
+                }
+                if cfg.training.use_ema:
+                    ckpt["ema_model"] = self.ema_model.state_dict()
+
+                torch.save(ckpt, model_path / f"epoch_{self.epoch:04d}.pt")
+            # Optional rollout evaluation during offline diffusion training.
+            rollout_after = getattr(self.cfg.training,"rollout_after")
+            rollout_every = getattr(self.cfg.training,"rollout_every")
+            if self.epoch >= rollout_after and self.epoch % rollout_every == 0:
+                offline_rollout_result = self._rollout(select_with_critic=False)
+        # After offline training, enter the online refinement loop:
+        # rollout -> critic/value update -> advantage-weighted policy improvement -> rollout.
+        # ============================================================
+        # After offline diffusion training: always rollout + improve
+        # ============================================================
+        self.diffusion_model.eval()
+        self.critic_network.eval()
+        self.v_net.eval()
+
+        # Repeat the online refinement procedure for the configured number of cycles.
+        for online_cycle in range(1, self.cfg.training.max_online_cycle + 1):
+
+            logger.info(
+                "online_cycle=%d start rollout",
+                online_cycle,
+                extra={"tag": "Online loop"}
+    )
+
+            # Evaluate the current policy before critic training and policy improvement.
+            # 1. Rollout before critic training / policy improvement.
+            # The first one is the evaluation immediately after offline
+            # diffusion training. Later ones evaluate the current improved
+            # policy before starting the next online cycle.
+            if online_cycle == 1:
+                rollout_phase = "diffusion_end"
+            else:
+                rollout_phase = f"before_improve_cycle_{online_cycle:02d}"
+
+            rollout_results = self._rollout(
+                select_with_critic=False,
+                phase=rollout_phase,
+            )
+
+            self._record_open_lengths(
+                rollout_results=rollout_results,
+                phase=rollout_phase,
+                online_cycle=online_cycle,
+            )
+
+            # Train critic/value networks using a mixture of online and offline data.
+            # 2. train critic with online + offline mixed data
+            self._training_critic(mode="online_training")
+
+            # Improve the diffusion policy using critic-derived advantage weights.
+            # 3. improve diffusion policy using advantage weight
+            self._policy_improvement(num_steps=200)
+
+            # Evaluate the improved policy using critic-guided action selection.
+            # 4. Rollout again after policy improvement.
+            after_improve_phase = f"after_improve_cycle_{online_cycle:02d}"
+            rollout_results_after_improve = self._rollout(
+                select_with_critic=True,
+                phase=after_improve_phase,
+            )
+            self._record_open_lengths(
+                rollout_results=rollout_results_after_improve,
+                phase=after_improve_phase,
+                online_cycle=online_cycle,
+            )
+
+    # Extract valid scalar final drawer-opening lengths from rollout results.
+    def _extract_final_open_lengths(self, rollout_results):
+        """Extract final drawer open length from each rollout result.
+
+        rollout() returns a list of episode dictionaries. Each dictionary
+        contains one scalar under ``final_open_len``.
+        """
+        if rollout_results is None:
+            return []
+
+        if isinstance(rollout_results, dict):
+            rollout_results = [rollout_results]
+
+        if not isinstance(rollout_results, (list, tuple)):
+            logger.warning(
+                "Unsupported rollout result type: %s",
+                type(rollout_results).__name__,
+                extra={"tag": "Open length"},
+            )
+            return []
+
+        final_open_lengths = []
+        for rollout_idx, result in enumerate(rollout_results):
+            if not isinstance(result, dict):
+                logger.warning(
+                    "rollout result %d is not a dict: %s",
+                    rollout_idx,
+                    type(result).__name__,
+                    extra={"tag": "Open length"},
+                )
+                continue
+
+            value = result.get("final_open_len")
+            if value is None:
+                logger.warning(
+                    "rollout result %d has no final_open_len; keys=%s",
+                    rollout_idx,
+                    list(result.keys()),
+                    extra={"tag": "Open length"},
+                )
+                continue
+
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().item()
+            elif isinstance(value, np.ndarray):
+                if value.size != 1:
+                    logger.warning(
+                        "rollout result %d has non-scalar final_open_len shape=%s",
+                        rollout_idx,
+                        value.shape,
+                        extra={"tag": "Open length"},
+                    )
+                    continue
+                value = value.reshape(-1)[0]
+
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid final_open_len in rollout %d: %r",
+                    rollout_idx,
+                    value,
+                    extra={"tag": "Open length"},
+                )
+                continue
+
+            if np.isfinite(value):
+                final_open_lengths.append(value)
+
+        return final_open_lengths
+
+    # Append rollout-level final opening lengths and summary statistics to CSV/TensorBoard.
+    def _record_open_lengths(self, rollout_results, phase: str, online_cycle: int):
+        """Append per-episode final open lengths and summary statistics to CSV."""
+        open_lengths = self._extract_final_open_lengths(rollout_results)
+        if not open_lengths:
+            logger.warning(
+                "No final open lengths found for phase=%s",
+                phase,
+                extra={"tag": "Open length"},
+            )
+            return
+
+        values = np.asarray(open_lengths, dtype=np.float64)
+        mean_value = float(values.mean())
+        std_value = float(values.std(ddof=0))
+
+        csv_path = Path(self.log_dir) / "open_length_history.csv"
+        write_header = not csv_path.exists()
+
+        with csv_path.open("a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow([
+                    "timestamp",
+                    "phase",
+                    "online_cycle",
+                    "episode_index",
+                    "final_open_length",
+                    "mean_open_length",
+                    "std_open_length",
+                ])
+
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            for episode_index, open_length in enumerate(open_lengths):
+                writer.writerow([
+                    timestamp,
+                    phase,
+                    online_cycle,
+                    episode_index,
+                    float(open_length),
+                    mean_value,
+                    std_value,
+                ])
+
+        tb_step = int(online_cycle)
+        self.writer.add_scalar(f"open_length/{phase}_mean", mean_value, tb_step)
+        self.writer.add_scalar(f"open_length/{phase}_std", std_value, tb_step)
+
+        logger.info(
+            "phase=%s cycle=%d num_rollouts=%d mean_open_length=%.6f std_open_length=%.6f values=%s",
+            phase,
+            online_cycle,
+            len(open_lengths),
+            mean_value,
+            std_value,
+            open_lengths,
+            extra={"tag": "Open length"},
+        )
+
+    # Train critic and value networks either purely offline or with mixed online/offline data.
+    def _training_critic(self, mode: str):
+        self.critic_network = self.critic_network.to(self.device)
+        self.v_net = self.v_net.to(self.device)
+
+        self.critic_network.train()
+        self.v_net.train()
+
+        self.critic_optimizer = optimizer_to(self.critic_optimizer, device=self.device)
+        self.v_net_optimizer = optimizer_to(self.v_net_optimizer, device=self.device)
+
+        horizon = int(getattr(self.cfg.training, "horizon", 16))
+        batch_size = int(getattr(self.cfg.training, "batch_size", 8))
+
+        # Offline critic training directly from demonstration batches.
+        if mode == "offline_training":
+            with tqdm.tqdm(
+                self.training_dataloader,
+                desc="Training Critic",
+                mininterval=1.0
+            ) as critic_epoch:
+                for critic_batch in critic_epoch:
+                    critic_window = build_sliding_window_batch(
+                        cfg=self.cfg,
+                        batch=critic_batch,
+                        env_goal_pos=self.env_goal_pos,
+                        horizon=horizon,
+                    )
+
+                    log = self._critic_train_step_from_window(critic_window)
+
+                    critic_epoch.set_postfix(
+                        critic_loss=log["critic_loss"],
+                        v_loss=log["v_loss"],
+                        q_mean=log["q_mean"],
+                        v_mean=log["v_mean"],
+                    )
+
+        # Online critic training using replay-buffer data mixed with offline demonstrations.
+        elif mode == "online_training":
+            online_steps = int(getattr(self.cfg.training, "online_critic_steps", 50))
+            mix_ratio = float(getattr(self.cfg.training, "online_mix_ratio", 0.8))
+
+            if self._offline_iter is None:
+                self._offline_iter = iter(self.training_dataloader)
+
+            with tqdm.tqdm(
+                total=online_steps,
+                desc="Online Critic Training",
+                mininterval=1.0
+            ) as pbar:
+                for _ in range(online_steps):
+                    online_batch = self.replaybuffer.load_sequence(
+                        seq_type="all",
+                        batch_size=batch_size,
+                    )
+
+                    try:
+                        offline_batch = next(self._offline_iter)
+                    except StopIteration:
+                        self._offline_iter = iter(self.training_dataloader)
+                        offline_batch = next(self._offline_iter)
+
+                    # Mix online and offline samples according to the configured ratio.
+                    mixed_raw_batch = mix_data(
+                        online_batch=online_batch,
+                        offline_batch=offline_batch,
+                        ratio=mix_ratio,
+                    )
+
+                    # Convert the mixed trajectories into critic sliding windows.
+                    mixed_window = build_sliding_window_batch(
+                        cfg=self.cfg,
+                        batch=mixed_raw_batch,
+                        env_goal_pos=self.env_goal_pos,
+                        horizon=horizon,
+                    )
+
+                    # Perform one Double-Q and value-network update and log diagnostics.
+                    log = self._critic_train_step_from_window(mixed_window)
+                    self.writer.add_scalar("critic_loss", log["critic_loss"], self.critic_step)
+                    self.writer.add_scalar("v_loss", log["v_loss"], self.critic_step)
+                    self.writer.add_scalar("q_mean", log["q_mean"], self.critic_step)
+                    self.writer.add_scalar("v_mean", log["v_mean"], self.critic_step)
+                    self.writer.add_scalar("reward_mean", log["reward_mean"], self.critic_step)
+                    self.writer.add_scalar("critic/q_target_mean", log["q_target_mean"], self.critic_step)
+                    self.writer.add_scalar("critic/q_target_std", log["q_target_std"], self.critic_step)
+                    self.writer.add_scalar("critic/q_target_max", log["q_target_max"], self.critic_step)
+                    self.writer.add_scalar("critic/q_target_min", log["q_target_min"], self.critic_step)
+                    self.writer.add_scalar("critic/reward_std", log["reward_std"], self.critic_step)
+                    self.writer.add_scalar("critic/reward_max", log["reward_max"], self.critic_step)
+                    self.writer.add_scalar("critic/reward_min", log["reward_min"], self.critic_step)
+                    self.critic_step += 1
+
+                    pbar.set_postfix(
+                        critic_loss=log["critic_loss"],
+                        v_loss=log["v_loss"],
+                        q_mean=log["q_mean"],
+                        v_mean=log["v_mean"],
+                    )
+                    pbar.update(1)
+
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        self.diffusion_model.train()
+
+    # Execute rollout evaluation with optional critic-guided action selection.
+    def _rollout(self, select_with_critic, phase="rollout"):
+        rollout_env = self.rollout_env
+        
+        self.diffusion_model.eval()
+        self.critic_network.eval()
+        self.v_net.eval()
+        
+        try:
+            rollout_results = rollout(
+                model=self.diffusion_model,
+                critic_network=self.critic_network,
+                select_with_critic=select_with_critic,
+                cond_norm_params=self.cond_norm_param_dict,
+                cfg=self.cfg,
+                device=self.device,
+                replaybuffer=self.replaybuffer,
+                rollout_env=rollout_env,
+                training_dataset=self.training_dataset,
+                action_norm_params=self.action_norm_params,
+                log_dir=self.log_dir,
+                epoch=self.epoch,
+                phase=phase,
+            )
+            return rollout_results
+        finally:
+           pass
+    # Improve the diffusion policy using advantage-weighted regression on online replay data.
+    def _policy_improvement(self, num_steps: int = 400):
+        self.diffusion_model.train()
+        self.critic_network.eval()
+        self.v_net.eval()
+
+        self.optimizer = optimizer_to(self.optimizer, device=self.device)
+
+        batch_size = int(getattr(self.cfg.training, "batch_size", 8))
+        horizon = int(getattr(self.cfg.training, "horizon", 16))
+
+        with tqdm.tqdm(total=num_steps, desc="Improve Policy", mininterval=1.0) as pbar:
+            for improve_step in range(num_steps):
+                improve_batch = self.replaybuffer.load_sequence(
+                    seq_type="all",
+                    batch_size=batch_size,
+                )
+
+                improve_window = build_sliding_window_batch(
+                    cfg=self.cfg,
+                    batch=improve_batch,
+                    env_goal_pos=self.env_goal_pos,
+                    horizon=horizon,
+                )
+
+                cond_t = improve_window["cond_t"]
+                improve_action = improve_window["act_window"].to(
+                    self.device,
+                    dtype=torch.float32,
+                )
+
+                n_cond, next_n_cond, visual_cond, action_mask, stage_out, next_stage_out = assemble_conditions(
+                    cond_t=cond_t,
+                    cond_norm_params=self.cond_norm_param_dict,
+                    batch_size=batch_size,
+                    device=self.device,
+                    error_scale=1,
+                    pull_start_t=36,
+                    build_action_mask=False,
+                )
+
+
+                # Compute Q, V, advantage, and exponential policy-improvement weights.
+                # ---------- compute advantage weight ----------
+                with torch.no_grad():
+                    q1, q2 = self.critic_network(
+                        state=n_cond,
+                        visual_obs=None,
+                        action=improve_action,
+                    )
+                    q = torch.min(q1, q2)
+
+                    v = self.v_net(
+                        visual_obs=None,
+                        low_dim_obs=next_n_cond,
+                    )
+
+                    if q.shape != v.shape:
+                        v = v.expand_as(q)
+
+                    adv = q - v
+
+                    beta = float(getattr(self.cfg.training, "improve_beta", 1.0))
+                    max_w = float(getattr(self.cfg.training, "max_improve_weight", 20.0))
+                    if self.cfg.training.enable_entropy == True:
+                        entropy_alpha = float(getattr(self.cfg.training, "improve_entropy_alpha", 0.01))
+                        action_std = improve_action.std(dim=1, keepdim=True).mean(dim=-1, keepdim=True)
+
+                            # Normalize entropy proxy to keep its scale stable.
+                        entropy_proxy = action_std / (action_std.mean().detach() + 1e-6)
+
+                            # Match advantage shape: [B, T, 1]
+                        entropy_proxy = entropy_proxy.expand_as(adv)
+
+                        # Only give entropy bonus to relatively good actions.
+                        # This avoids encouraging random low-Q actions.
+                        adv_gate = (adv > adv.mean()).float()
+
+                        adv_entropy = adv + entropy_alpha * entropy_proxy * adv_gate
+                        weight = torch.exp(adv_entropy / beta)
+                        weight = torch.clamp(weight, max=max_w)
+                        weight = weight / (weight.mean().detach() + 1e-6)
+                    elif self.cfg.training.enable_entropy == False:
+
+                        weight = torch.exp(adv / beta)
+                        weight = torch.clamp(weight, max=max_w)
+                        weight = weight / (weight.mean() + 1e-6)
+
+                # Update the diffusion policy using weighted diffusion loss.
+                # ---------- weighted diffusion update ----------
+                self.optimizer.zero_grad(set_to_none=True)
+
+                raw_loss = self.diffusion_model.compute_loss(
+                    action=improve_action,
+                    cond=cond_t,   # 注意这里应该传 cond_t，不是 cond_t["cond"]
+                    action_norm_params=self.action_norm_params,
+                    cond_norm_params=self.cond_norm_param_dict,
+                    improve=True,
+                    w=weight,
+                )
+
+                raw_loss.backward()
+                self.optimizer.step()
+
+                improve_log = {
+                    "loss": float(raw_loss.item()),
+                    "weight_mean": float(weight.mean().item()),
+                    "weight_max": float(weight.max().item()),
+                    "adv_mean": float(adv.mean().item()),
+                    "adv_max": float(adv.max().item()),
+                }
+
+                self.writer.add_scalar("improve/loss", improve_log["loss"], self.improve_step)
+                self.writer.add_scalar("improve/weight_mean", improve_log["weight_mean"], self.improve_step)
+                self.writer.add_scalar("improve/weight_max", improve_log["weight_max"], self.improve_step)
+                self.writer.add_scalar("improve/adv_mean", improve_log["adv_mean"], self.improve_step)
+                self.writer.add_scalar("improve/adv_max", improve_log["adv_max"], self.improve_step)
+
+                logger.info(
+                    "improve_step=%d loss=%.6f weight_mean=%.6f weight_max=%.6f adv_mean=%.6f adv_max=%.6f",
+                    improve_step,
+                    improve_log["loss"],
+                    improve_log["weight_mean"],
+                    improve_log["weight_max"],
+                    improve_log["adv_mean"],
+                    improve_log["adv_max"],
+                    extra={"tag": "Policy improvement"},
+                )
+
+                pbar.set_postfix(
+                    loss=improve_log["loss"],
+                    w_mean=improve_log["weight_mean"],
+                    adv_mean=improve_log["adv_mean"],
+                )
+                pbar.update(1)
+
+                self.improve_step += 1
+
+
+# Hydra entry point for constructing and running the training workspace.
+@hydra.main(
+    config_path=str(Path(__file__).parent.parent.parent.joinpath("config")),
+    config_name="ddpm_critic_training",
+    version_base="1.1"
+)
+def main(cfg):
+    workspace = TrainDiffusionWorkspace(cfg=cfg)
+    workspace.run()
+
+
+if __name__ == "__main__":
+    main()
