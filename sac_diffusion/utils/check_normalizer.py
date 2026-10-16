@@ -1,3 +1,4 @@
+#This code is for testing normalizer function. It is not involved in the training  
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as R
