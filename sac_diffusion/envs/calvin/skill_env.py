@@ -1,3 +1,7 @@
+# Task-specific CALVIN simulation environment for diffusion-policy rollout.
+# It wraps the original PlayTableSimEnv to configure skill-dependent scene states,
+# expose policy-friendly observations, compute drawer-task rewards and success,
+# and execute Cartesian robot actions in PyBullet.
 import logging
 import hydra
 import gc
