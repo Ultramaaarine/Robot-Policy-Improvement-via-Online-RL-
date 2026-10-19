@@ -1,5 +1,4 @@
-# 这个文件将提取出的demo送到GMM里面去训练
-# 2025年11月14日 开始将此dataset改为 online offline 混合dataset 
+# this file is inherited from another repo, not relevant to my work
 import glob
 import os
 import numpy as np
