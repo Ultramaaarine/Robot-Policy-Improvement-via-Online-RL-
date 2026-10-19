@@ -1,4 +1,4 @@
-# This is a copy of skill_data
+# This is a copy of Task_D_D_dataset
 #这是最初的dataset 本体为放在dataset文件夹里面的 Task_D_D 或者Task_ABC_D或者debug
 #demo 是从这里提取出来的
 # 这里面有 visual obs action depth scene obs 的数据 可用于对 online 数据归一化
