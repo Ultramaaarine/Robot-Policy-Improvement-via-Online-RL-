@@ -1,3 +1,7 @@
+# Rollout utilities for building online conditions, sampling diffusion actions,
+# critic-guided candidate selection, reward shaping, replay-buffer storage,
+# and rollout diagnostics/statistics.
+
 # cond: total 20 dim: pos:3, joints: 7, subgoal_active_error: 3, pull_dir: 3, progress: 1, goal: 3 (read from env, not from offline dataset)
 # is a torch.tensor 
 # obs,pos seq has only one batch size, not like offline dataset
@@ -16,6 +20,8 @@ from sac_diffusion.utils.common_funcs import extract_obs
 from sac_diffusion.utils.save_array_stats import save_array_stats
 from sac_diffusion.utils.common_funcs import compute_shaped_reward
 
+# Prepare demonstration-derived rollout targets.
+# The reach goal comes from the environment, while pull targets come from offline data.
 def prepare_rollout_targets(training_dataset, cfg): # reach goal is acquired from env move to build_cond, here only offline data
     align_end = int(getattr(cfg.training, "align_end_t", 36))
     pull_start_t = int(getattr(cfg.training, "pull_start_t", align_end))
@@ -71,6 +77,7 @@ def prepare_rollout_targets(training_dataset, cfg): # reach goal is acquired fro
         "demo_pull_dir_np": demo_pull_dir_np,
     }
 
+# Recursively repeat tensors in a nested structure K times along batch dimension.
 def repeat_tensor_tree(x, K: int):
     if x is None:
         return None
@@ -85,6 +92,8 @@ def repeat_tensor_tree(x, K: int):
     return x
 
 
+# Repeat one rollout condition K times so the diffusion policy can generate
+# multiple candidate action sequences from the same current observation.
 def repeat_cond_t_batch(cond_t: dict, K: int):
     cond_t_k = {}
     for key, value in cond_t.items():
@@ -96,6 +105,7 @@ def repeat_cond_t_batch(cond_t: dict, K: int):
     cond_t_k["batch_size"] = K
     return cond_t_k
 
+# Build rollout-time conditions, stage labels, goal features, and padding masks.
 def build_rollout_cond(
     cfg,
     device,
@@ -127,6 +137,7 @@ def build_rollout_cond(
     subgoal_pull_np = np.asarray(demo_info["subgoal_pull_np"], dtype=np.float32).reshape(-1)[:3]
     demo_pull_dir_np = np.asarray(demo_info["demo_pull_dir_np"], dtype=np.float32).reshape(-1)[:3]
 
+    # Build fixed-length rollout observation and joint-history windows.
     # ------------------------------------------------------------
     # 1. rollout history window: [t-To+1, ..., t]
     # deque 里已经是 left-padded 后的长度 To
@@ -152,6 +163,7 @@ def build_rollout_cond(
                 f"rollout_gripper_window length {rollout_gripper_window.shape[0]} != To {To}"
             )
 
+    # Keep step-based progress only for logging and compatibility.
     # ------------------------------------------------------------
     # 2. progress index
     # Do NOT use nearest-demo progress anymore.
@@ -160,6 +172,7 @@ def build_rollout_cond(
     # ------------------------------------------------------------
     progress_idx = int(np.clip(t, 0, traj_T - 1))
 
+    # Build observation/action validity and padding masks.
     # ------------------------------------------------------------
     # 3. padding masks
     #
@@ -204,6 +217,7 @@ def build_rollout_cond(
 
     action_loss_mask = action_valid_mask.float()  # [1, Ta]
 
+    # Build rollout-step-based task stages: 0=reach, 1=align, 2=pull.
     # ------------------------------------------------------------
     # 4. rollout-step based stage, independent of progress_idx
     #
@@ -241,6 +255,7 @@ def build_rollout_cond(
         dtype=torch.float32,
     )  # [1, Ta, 1]
 
+    # Construct a future goal window from the offline demonstration trajectory.
     # ------------------------------------------------------------
     # 5. goal window
     # use rollout step, not progress_idx
@@ -275,6 +290,7 @@ def build_rollout_cond(
     goal_pos_window = goal_window[:, :3].astype(np.float32)
     goal_pos = goal_pos_window[-1].copy()
 
+    # Compute goal errors, distances, and normalized goal directions.
     # ------------------------------------------------------------
     # 6. goal errors
     # ------------------------------------------------------------
@@ -283,6 +299,7 @@ def build_rollout_cond(
     goal_dist_np = np.sqrt(goal_dist2_np + 1e-6).astype(np.float32)
     goal_dir_np = goal_error_np / (goal_dist_np + 1e-6)
 
+    # Build reach/pull subgoals and stage-dependent active subgoal features.
     # ------------------------------------------------------------
     # 7. subgoals
     # ------------------------------------------------------------
@@ -313,6 +330,7 @@ def build_rollout_cond(
         subgoal_pull_error_np,
     ).astype(np.float32)
 
+    # Build pull-direction features and activate them only during pull stage.
     # ------------------------------------------------------------
     # 8. pull direction
     # 暂时不改，仍然使用 demo_pull_dir_np
@@ -325,6 +343,7 @@ def build_rollout_cond(
 
     pull_dir_np *= (stage_seq_np == 2.0).astype(np.float32)
 
+    # Assemble the condition dictionary used by the policy/critic pipeline.
     # ------------------------------------------------------------
     # 9. cond dict
     #
@@ -482,6 +501,7 @@ def build_rollout_cond(
         },
     }
 
+# Convert a selected action sequence into the first executable action.
 def _first_action_np(action_candidate: torch.Tensor) -> np.ndarray:
     """
     Convert selected action candidate to one executable action [Da].
@@ -502,6 +522,7 @@ def _first_action_np(action_candidate: torch.Tensor) -> np.ndarray:
     return action.detach().cpu().numpy().astype(np.float32)
 
 
+# Sample K diffusion action sequences and optionally use the critic to select one.
 def select_rollout_action(
     select_with_critic,
     model,
@@ -514,9 +535,11 @@ def select_rollout_action(
 ):
     K = 8
 
+    # Duplicate the single rollout condition into a K-candidate batch.
     cond_t = build_out["cond_t"]
     cond_t_k = repeat_cond_t_batch(cond_t, K)
 
+    # Generate K candidate action sequences from the diffusion policy.
     action_seq = model.predict_action(
         cond=cond_t_k,
         action_mode="pos",
@@ -528,6 +551,7 @@ def select_rollout_action(
 
     action_seq = action_seq.to(device)  # [K, Ta, Da]
 
+    # Use critic-guided selection when enabled.
     if select_with_critic:
         n_cond, next_n_cond, visual_cond, action_mask, stage_out, next_stage_out = assemble_conditions(
             cond_t=cond_t_k,
@@ -555,6 +579,7 @@ def select_rollout_action(
                 *visual_cond.shape[2:],
             ).contiguous()
 
+        # Score and select one candidate sequence with the critic.
         action_candidate, selected_idx, scores, probs = select_action(
             critic_network,
             action_seq=action_seq,
@@ -584,6 +609,7 @@ def select_rollout_action(
         }
 
 
+# Save rollout diagnostics, diffusion traces, trajectories, and final task metrics.
 def save_rollout_result(
     model,
     result,
@@ -647,6 +673,7 @@ def save_rollout_result(
     with open(roll_dir/"final_open_len.txt","w") as f:
         f.write(f"{final_open_len:.8f}\n")
 
+# Save diffusion denoising traces separately for each rollout step.
 def _save_trace_by_rollout_step(trace_arr: np.ndarray, out_dir: Path, prefix: str):
         """
         trace_arr: [N, 7] columns =
@@ -671,6 +698,8 @@ def _save_trace_by_rollout_step(trace_arr: np.ndarray, out_dir: Path, prefix: st
                 header="rollout_step,denoise_i,timestep,x_mean,x_std,x_min,x_max,x0_mean,x0_std,x0_min,x0_max",
                 comments=""
             )
+# Run one complete receding-horizon rollout episode.
+# Collect transitions, compute shaped rewards, update histories, and save diagnostics.
 def rollout_one_episode(
     model,
     critic_network,
@@ -692,6 +721,7 @@ def rollout_one_episode(
     max_rel_pos = float(rollout_env.robot.max_rel_pos)
     max_step = replaybuffer.seq_len
     #rollout_env.manual_base_bias = np.array([0.005, 0.0, 0.0], dtype=np.float32)
+    # Reset the environment and read the initial observation and environment goal.
     env_obs = rollout_env.reset() # get scene obs (target pos) then send to build_cond func
     # print(f"obs has keys: {env_obs.keys()}")
     # print("eef position:", env_obs["position"])
@@ -704,6 +734,7 @@ def rollout_one_episode(
     eef_pos = env_obs["position"].astype(np.float32)
     joint_pos = env_obs["joints"].astype(np.float32)
 
+    # Initialize left-padded rollout history buffers.
     obs_hist = deque([eef_pos.copy()] * To, maxlen=To) # use this to compute reward 
     
     joint_hist = deque([joint_pos.copy()] * To, maxlen=To)
@@ -713,6 +744,7 @@ def rollout_one_episode(
         gripper_obs = env_obs["rgb_gripper"].astype(np.float32) / 255.0
         gripper_hist = deque([gripper_obs.copy()] * To, maxlen=To)
 
+    # Buffers for rollout trajectories, actions, errors, and statistics.
     total_r = 0.0
     pred_actions = []
     exec_actions = []
@@ -733,7 +765,9 @@ def rollout_one_episode(
     done = False
     progress_idx = 0
 
+    # Main receding-horizon rollout loop.
     for t in range(max_step):
+        # Build model conditions from the current rollout history and targets.
         build_out = build_rollout_cond(
             cfg=cfg,
             device=device,
@@ -762,6 +796,7 @@ def rollout_one_episode(
         errors.append(build_out["goal_error_np"].copy())
         err_norm.append(float(np.linalg.norm(build_out["goal_error_np"][-1])))
        
+        # Generate candidate action sequences and choose the action to execute.
         act_out = select_rollout_action(
             select_with_critic = select_with_critic,
             model=model,
@@ -787,6 +822,7 @@ def rollout_one_episode(
         controls.append(u.copy())
 
         #time.sleep(0.05)
+        # Execute one environment step and measure drawer motion.
         env_obs = rollout_env.get_obs()
         drawer_open_length = env_obs["state"][16]
         next_obs, reward, done, info = rollout_env.step(u)
@@ -814,9 +850,11 @@ def rollout_one_episode(
         ).astype(np.float32)
         goal_dist = float(np.linalg.norm(next_active_err_window[-1]))
 
+        # Compute shaped reward from environment, demonstration, and goal terms.
         shaped_reward = compute_shaped_reward(cfg = cfg,reward=reward,
                                               goal_dist = goal_dist, rollout_obs_window = next_rollout_obs_window,
                                               traj_pos_np=demo_info["traj_pos_np"], To=To, rollout_step = t, device=device) 
+        # Additional reward shaping for the drawer-opening task.
         if cfg.skill.name == "calvin_open_drawer":
         
             delta_open = np.clip(next_drawer_open_length - drawer_open_length, -0.01, 0.01)
@@ -840,6 +878,7 @@ def rollout_one_episode(
 
                 if idx >= 0:
                     shaped_reward += rewards[idx]
+        # Additional reward shaping for the drawer-closing task.
         elif cfg.skill.name == "calvin_close_drawer":
             delta_open = np.clip(next_drawer_open_length - drawer_open_length, -0.01, 0.01) 
             if curr_stage >= 2.0:
@@ -852,13 +891,9 @@ def rollout_one_episode(
                 0.06, 0.07, 0.09, 0.1, 0.13, 0.14,0.15, 0.16
                 ])
 
-                # rewards = np.array([
-                # 0.5, 1.0, 2.0, 3.0, 4.0,
-                # 5.0, 6.0, 7.0, 8.0, 8.5, 9.0, 10.0, 11.0,12.0
-                # ])
                 rewards = np.array([
                 12.0, 11.0, 10.0, 9.0, 8.5,
-                8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0,0.5
+                8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0,5
                 ])
 
                 idx = np.searchsorted(thresholds, next_drawer_open_length, side="left") - 1
@@ -870,6 +905,7 @@ def rollout_one_episode(
                 shaped_reward += rewards[idx]
                         
 
+        # Store the transition for online replay-buffer training.
         print(f"out has keys: {out.keys()}")
         transition_seq.append(
             {
@@ -900,11 +936,13 @@ def rollout_one_episode(
         if done:
             break
 
+    # Save only complete fixed-length trajectories into the replay buffer.
     print(f"transition len is: {len(transition_seq)}, replaybuffer.seq_len is: {replaybuffer.seq_len}")
 
     if len(transition_seq) == replaybuffer.seq_len:
         replaybuffer.save_sequence(transition_seq)
 
+    # Pack rollout outputs and statistics into a result dictionary.
     result = {
         "final_open_len":final_open_len,
         "pred_actions": np.asarray(pred_actions, dtype=np.float32),
@@ -936,6 +974,7 @@ def rollout_one_episode(
     )
     result["rollout_dir"] = roll_dir
 
+    # Save rollout diagnostics to disk.
     save_rollout_result(
         model=model,
         result=result,
@@ -945,6 +984,7 @@ def rollout_one_episode(
     return result
 
 
+# Run multiple rollout episodes and summarize final drawer-opening statistics.
 def rollout(
     model,
     critic_network,
@@ -960,15 +1000,18 @@ def rollout(
     epoch,
     phase="rollout",
 ):
+    # Clear model-side rollout diagnostics before starting.
     model.noise_stats_log.clear()
     model.diffusion_trace_log.clear()
     model.action_trace_log.clear()
     was_training = model.training
 
     try:
+        # Run rollout in evaluation mode.
         model.eval()
         demo_info = prepare_rollout_targets(training_dataset=training_dataset,cfg=cfg)
 
+        # Execute the configured number of rollout episodes.
         all_results = []
         for rollout_i in range(cfg.training.rollout_times):
             result = rollout_one_episode(
@@ -995,6 +1038,7 @@ def rollout(
             if result["final_open_len"] is not None
         ],dtype = np.float32,
         )
+        # Compute aggregate final-drawer statistics across rollouts.
         if final_open_lengths.size > 0:
             final_open_mean = float(np.mean(final_open_lengths))
 
@@ -1050,6 +1094,7 @@ def rollout(
 
         return all_results
 
+    # Restore training mode if the model was previously training.
     finally:
         if was_training:
             model.train()
