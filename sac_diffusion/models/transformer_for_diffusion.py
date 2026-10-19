@@ -1,459 +1,128 @@
-# Transformer-based diffusion model for action denoising.
-# Observation features are encoded as condition memory, while noisy action tokens
-# cross-attend to this memory together with stage and positional embeddings.
+# 导入日志、配置实例化、资源回收、仿真环境和数值计算所需的模块。
+import logging
+import hydra
+import gc
+import sys
+import os
+import pkgutil
+import gym
+import pybullet as p
+import pybullet_utils.bullet_client as bc
+import numpy as np
+import math
+from calvin_env.calvin_env.envs.play_table_env import PlayTableSimEnv
 
-import torch
-import torch.nn as nn
-from typing import Literal, Optional
-from sac_diffusion.utils.positional_embedder import SinusoidalEmbbeder, PositionalEmbeder
-from sac_diffusion.models.mixed_obs_MLP import Mixed_Obs_MLP
+# 创建当前模块的日志记录器。
+logger = logging.getLogger(__name__)
 
+# here are the indices of data in the observation vector
+# here [0,1,2] - gripper position; [3,4,5] - gripper orientation, [14] - gripper action, [6] - gripper width
+# 机器人观测向量中的索引：末端位置 0～2、姿态 3～5、关节角 7～13。
+CALVIN_POSITION_INDICES = np.array([0, 1, 2])
+CALVIN_ORIENTATION_INDICES = np.array([3, 4, 5])
+CALVIN_JOINTS_INDICES = np.array([7, 8, 9, 10, 11, 12, 13])
+# 拼接位置与姿态索引，得到末端六维位姿对应的索引。
+CALVIN_6D_INDICES = np.concatenate([CALVIN_POSITION_INDICES, CALVIN_ORIENTATION_INDICES])
 
-class DiffusionTransformer(nn.Module):
-    def __init__(
-        self,
-        cond_dim: int,
-        action_dim: int,
-        enable_visual_obs: bool,
-        low_dim_obs_encoder_out_dim: int,
-        use_visual_obs_only: bool,
-        diffusion_input_dim: int,
-        visual_obs_feature_dim: int,
-        combine_obs: bool,
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        dim_feedforward: int,
-        dropout: float,
-        max_len: int,
-        use_time_mlp: bool = True,
-        num_stages: int = 3,
-        stage_emb_dim: int = 32,
-        cond_num_layers: int = 1,
-    ):
-        super().__init__()
+from gym.envs.registration import register
 
-        # Basic model dimensions.
-        self.cond_dim = int(cond_dim)
-        self.action_dim = int(action_dim)
-        self.d_model = int(d_model)
-        self.num_stages = int(num_stages)
-        self.stage_emb_dim = int(stage_emb_dim)
-
-        # Observation encoder configuration.
-        self.enable_visual_obs = enable_visual_obs
-        self.low_dim_obs_encoder_out_dim = low_dim_obs_encoder_out_dim
-        self.visual_obs_feature_dim = visual_obs_feature_dim
-        self.diffusion_input_dim = diffusion_input_dim
-        self.use_visual_obs_only = use_visual_obs_only
-        self.combine_obs = combine_obs
-
-        # input projection
-        # Project noisy action vectors into Transformer token dimension.
-        self.input_proj = nn.Linear(self.action_dim, self.d_model)
-
-        # cond encoder -> [B,T,d_model]
-        # Encode low-dimensional and optional visual observations into condition tokens.
-        self.obs_embeder = Mixed_Obs_MLP(
-            self.d_model,
-            self.cond_dim,
-            self.enable_visual_obs,
-            self.low_dim_obs_encoder_out_dim,
-            self.visual_obs_feature_dim,
-            self.diffusion_input_dim,
-            self.use_visual_obs_only,
-            self.combine_obs
-        )
-
-        # Generic positional embedding.
-        self.pos_emb = PositionalEmbeder(
-            emb_dim=self.d_model,
-            max_len=max_len
-        )
-
-        # Positional embedding for observation / condition tokens.
-        self.cond_pos_emb = PositionalEmbeder(
-            emb_dim=self.d_model,
-            max_len=max_len
-        )
-
-        # Positional embedding for future action tokens.
-        self.action_pos_emb = PositionalEmbeder(
-            emb_dim=self.d_model,
-            max_len=max_len
-        )
+# 向 Gym 注册环境；通过 Gym 创建时，注册的时间上限为 64 步。
+register(id="skill-env", entry_point="sac_diffusion.envs.calvin:CalvinSkillEnv", max_episode_steps=64)
 
 
-        # diffusion timestep emb
-        # Encode the diffusion timestep into d_model dimensions.
-        self.time_emb = SinusoidalEmbbeder(self.d_model)
+# CALVIN 技能环境：在桌面仿真环境上增加技能配置、观测筛选和奖励逻辑。
+class CalvinSkillEnv(PlayTableSimEnv):
+    # 初始化技能环境；cfg 为整体配置，skill 为技能配置，init_pos 为可选末端初始位置。
+    def __init__(self, cfg, skill, init_pos):
+        print("===Initializing CalvinSkillEnv ===")
+        # 保存技能配置，并将环境配置的顶层内容展开为字典。
+        self.skill = skill
+        pt_cfg = {**cfg.calvin_env.env}
+        # 移除 Hydra 的控制字段，避免将它们作为普通参数传给父类。
+        pt_cfg.pop("_target_", None)
+        pt_cfg.pop("_recursive_", None)
 
-        # Optional MLP applied to the diffusion timestep embedding.
-        if use_time_mlp:
-            self.time_mlp = nn.Sequential(
-                nn.Linear(self.d_model, self.d_model * 4),
-                nn.SiLU(),
-                nn.Linear(self.d_model * 4, self.d_model),
-            )
-        else:
-            self.time_mlp = nn.Identity()
-
-        # stage embedding (Learned Positional Embedding) not same as positional embedding
-        # Learn one embedding vector for each task stage.
-        self.stage_emb = nn.Embedding(self.num_stages, self.stage_emb_dim) # get 3 stages, for each stage, we embded it as a vector [1,2,3]-> [vector,vector,vector]
+        # 根据技能调整场景初始状态，例如执行关抽屉技能前先打开抽屉。
+        self.set_scene_cfg(pt_cfg["scene_cfg"])
         
-        # Project stage embedding into Transformer model dimension.
-        self.stage_proj = nn.Sequential(
-            nn.Linear(self.stage_emb_dim, self.d_model),
-            nn.SiLU(),
-            nn.Linear(self.d_model, self.d_model),
-        )
+        # 在父类初始化前保存机器人和相机配置，供 load() 使用。
+        self.robot_cfg = pt_cfg["robot_cfg"]
+        self.cameras_c = pt_cfg["cameras"]
+        # 调用父类完成基础环境初始化。
+        super(CalvinSkillEnv, self).__init__(**pt_cfg) # still env config
 
-        # Transformer encoder for observation / condition tokens.
-        cond_encoder_layer = nn.TransformerEncoderLayer(
-            d_model = self.d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True
-        )
+        # 记录机器人基座位姿及当前末端目标位姿，供后续初始化或采样使用。
+        self.init_base_pos, self.init_base_orn = self.p.getBasePositionAndOrientation(self.robot.robot_uid)
+        self.init_gripper_pos = self.robot.target_pos
+        self.init_gripper_orn = self.robot.target_orn
+        # 末端位置采样噪声的标准差；obs_space 指定需要输出哪些观测。
+        self.ee_noise = np.array(cfg.ee_noise)
+        self.obs_space = cfg.obs_space
 
-        self.cond_encoder = nn.TransformerEncoder(
-            cond_encoder_layer,
-            num_layers=int(cond_num_layers)
-        )
+        self.init_pos = init_pos
 
-        # Transformer decoder for noisy action tokens.
-        # Action tokens cross-attend to encoded observation memory.
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
+        # 保存技能步数上限；本类 step() 没有直接根据该值判断超时。
+        self.max_episode_steps = self.skill.max_steps
+        # 根据 Hydra 配置创建任务判定器，用来判断技能是否成功。
+        self.tasks = hydra.utils.instantiate(cfg.calvin_env.tasks)
 
-        self.action_decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=num_layers
-        )
+        # 保存源环境标记；真实任务关键点在 reset() 中更新。
+        self.is_source = cfg.is_source
+        self.gt_keypoint = None
+        print("===CalvinSkillEnv is initialized===")
 
+    # 清空物理世界，设置重力，再加载机器人、场景及相机。
+    def load(self):
+        logger.info("Resetting simulation")
+        self.p.resetSimulation(physicsClientId=self.cid)
+        logger.info("Setting gravity")
+        self.p.setGravity(0, 0, -9.8, physicsClientId=self.cid)
 
-        # Additional Transformer encoder definition.
-        encoder_layer = nn.TransformerEncoderLayer(
-               d_model=self.d_model,
-               nhead=nhead,
-               dim_feedforward=dim_feedforward,
-               dropout=dropout,
-               activation="gelu",
-               batch_first=True,
-               norm_first=True,
-         )
+        # 将物理客户端 ID 传给机器人，并将客户端和随机数生成器传给场景。
+        self.robot = hydra.utils.instantiate(self.robot_cfg, cid=self.cid)
+        self.scene = hydra.utils.instantiate(self.scene_cfg, p=self.p, cid=self.cid, np_random=self.np_random)
 
-        self.transformer = nn.TransformerEncoder(
-               encoder_layer,
-               num_layers=num_layers
-        ) # assembel a transformer with muitiple nn.TRansformerEncoderLayer
-        
-        # Normalize decoder features before output heads.
-        self.final_norm = nn.LayerNorm(self.d_model)
-        
-        # Predict task-stage logits from action-token features.
-        self.stage_head = nn.Linear(self.d_model,self.num_stages)
+        self.robot.load()
+        self.scene.load()
 
-        # Project Transformer features back to action dimension.
-        self.out_proj_layer = nn.Linear(self.d_model, self.action_dim)
-
-    def _to_bool_padding_mask(
-        self,
-        mask: Optional[torch.Tensor],
-        shape: tuple[int, int],
-        device: torch.device,
-        name: str,
-    ) -> Optional[torch.Tensor]:
-        """
-        Padding mask convention:
-            True  = padding / ignore
-            False = valid
-        """
-
-        # No padding mask provided.
-        if mask is None:
-            return None
-
-        # Validate mask shape against the expected token sequence shape.
-        if mask.shape != shape:
-            raise ValueError(
-                f"{name} must have shape {shape}, got {mask.shape}"
+        # init cameras after scene is loaded to have robot id available
+        # 逐个实例化相机；此时机器人和场景已加载，可以提供对象 ID。
+        self.cameras = [
+            hydra.utils.instantiate(
+                self.cameras_c[name], cid=self.cid, robot_id=self.robot.robot_uid, objects=self.scene.get_objects()
             )
-
-        # Transformer padding masks must be boolean tensors on the correct device.
-        return mask.to(device=device, dtype=torch.bool)
-
-    def _zero_padded_tokens(
-        self,
-        tokens: torch.Tensor,                  # [B, T, D]
-        padding_mask: Optional[torch.Tensor],  # [B, T], True = padding
-    ) -> torch.Tensor:
-
-        # If no padding exists, keep tokens unchanged.
-        if padding_mask is None:
-            return tokens
-
-        # Explicitly zero all padded token embeddings.
-        return tokens.masked_fill(
-            padding_mask.unsqueeze(-1),
-            0.0,
-        )
-
-    def _build_action_stage_feat(
-        self,
-        stage: Optional[torch.Tensor],
-        B: int,
-        Ta: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        stage should align with future action horizon:
-            stage: [B, Ta], [B, Ta, 1], or [B, 1]
-        """
-
-        # If no stage information is provided, default all actions to stage 0.
-        if stage is None:
-            stage_seq = torch.zeros(
-                (B, Ta),
-                device=device,
-                dtype=torch.long,
-            )
-
-        else:
-            # Accept either [B, Ta, 1] or [B, Ta].
-            if stage.dim() == 3 and stage.shape[-1] == 1:
-                stage_seq = stage[..., 0]
-            elif stage.dim() == 2:
-                stage_seq = stage
-            else:
-                raise ValueError(f"Unexpected stage shape: {stage.shape}")
-
-            # Stage batch dimension must match action batch size.
-            if stage_seq.shape[0] != B:
-                raise ValueError(
-                    f"stage batch {stage_seq.shape[0]} != action batch {B}"
-                )
-
-            # Broadcast one stage label across the entire action horizon.
-            if stage_seq.shape[1] == 1:
-                stage_seq = stage_seq.expand(B, Ta)
-
-            # Final stage tensor must align with every future action token.
-            if stage_seq.shape != (B, Ta):
-                raise ValueError(
-                    f"stage must broadcast to [B, Ta], got {stage_seq.shape}, "
-                    f"expected {(B, Ta)}. "
-                    f"Remember: stage should align with future action indices."
-                )
-
-            # Convert stage IDs to valid embedding indices.
-            stage_seq = stage_seq.to(device=device)
-            stage_seq = stage_seq.long().clamp(
-                min=0,
-                max=self.num_stages - 1,
-            )
-
-        # Convert stage IDs into learned stage embeddings.
-        stage_feat = self.stage_emb(stage_seq)       # [B, Ta, stage_emb_dim]
-
-        # Project stage embeddings to d_model.
-        stage_feat = self.stage_proj(stage_feat)     # [B, Ta, d_model]
-
-        return stage_feat
-
-    def forward(
-        self,
-        x: torch.Tensor,                    # [B, Ta, action_dim], noisy action
-        low_dim_obs: torch.Tensor,          # [B, To, cond_dim]
-        visual_obs: Optional[torch.Tensor], # [B, To, C, H, W] or None
-        diffusion_t: torch.Tensor,          # [B]
-        stage: Optional[torch.Tensor] = None,  # future action stage: [B, Ta, 1] / [B, Ta] / [B, 1]
-        mode: Literal["sequence", "global"] = "sequence",
-
-
-        # new names
-        cond_padding_mask: Optional[torch.Tensor] = None,     # [B, To], True = padded cond token
-        action_padding_mask: Optional[torch.Tensor] = None,  # [B, Ta], True = padded action token
-
-        return_stage_logits: bool = False,
-    ) -> torch.Tensor:
-
-        # Validate noisy action input.
-        if x.ndim != 3:
-            raise ValueError(f"x must be [B, Ta, action_dim], got {x.shape}")
-
-        if x.shape[-1] != self.action_dim:
-            raise ValueError(
-                f"x last dim {x.shape[-1]} != action_dim {self.action_dim}"
-            )
-
-        # Validate low-dimensional observation sequence.
-        if low_dim_obs.ndim != 3:
-            raise ValueError(
-                f"low_dim_obs must be [B, To, cond_dim], got {low_dim_obs.shape}"
-            )
-
-        if low_dim_obs.shape[-1] != self.cond_dim:
-            raise ValueError(
-                f"low_dim_obs last dim {low_dim_obs.shape[-1]} != cond_dim {self.cond_dim}"
-            )
-
-        # Extract batch size and temporal dimensions.
-        B, Ta, _ = x.shape
-        B_obs, To, _ = low_dim_obs.shape
-        device = x.device
-
-        # Observation batch and action batch must match.
-        if B_obs != B:
-            raise ValueError(
-                f"Batch mismatch: x batch={B}, low_dim_obs batch={B_obs}"
-            )
-
-
-        # Convert observation padding mask to Transformer-compatible boolean format.
-        obs_padding_mask = self._to_bool_padding_mask(
-            cond_padding_mask,
-            shape=(B, To),
-            device=device,
-            name="obs_padding_mask",
-        )
-
-        #print(f"obs_padding_mask is {obs_padding_mask}")
-
-        # Convert action padding mask to Transformer-compatible boolean format.
-        action_padding_mask = self._to_bool_padding_mask(
-            action_padding_mask,
-            shape=(B, Ta),
-            device=device,
-            name="action_padding_mask",
-        )
-
-        #print(f"action_padding_mask is {action_padding_mask}")
-
-        # ------------------------------------------------------------
-        # 1. cond / obs tokens
-        # ------------------------------------------------------------
-
-        # Fuse and encode low-dimensional and optional visual observations.
-        encoded_cond = self.obs_embeder(
-            visual_obs=visual_obs,
-            low_dim_obs=low_dim_obs,
-            time_emb=diffusion_t,
-        )  # [B, To, d_model]
-
-        # Verify observation encoder output shape.
-        if encoded_cond.ndim != 3:
-            raise ValueError(
-                f"encoded_cond must be [B, To, d_model], got {encoded_cond.shape}"
-            )
-
-        if encoded_cond.shape != (B, To, self.d_model):
-            raise ValueError(
-                f"encoded_cond shape {encoded_cond.shape} != expected {(B, To, self.d_model)}"
-            )
-
-        # padding token 先置零
-        # Remove feature values from padded observation tokens.
-        encoded_cond = self._zero_padded_tokens(
-            encoded_cond,
-            obs_padding_mask,
-        )
-
-        # cond positional embedding
-        # Inject temporal position information into condition tokens.
-        encoded_cond = self.cond_pos_emb(encoded_cond)
-
-        # cond encoder
-        # Encode the complete observation sequence into Transformer memory.
-        memory = self.cond_encoder(
-            encoded_cond,
-            src_key_padding_mask=obs_padding_mask,
-        )  # [B, To, d_model]
-
-        # ------------------------------------------------------------
-        # 2. noisy action tokens
-        # ------------------------------------------------------------
-
-        # Project noisy actions into Transformer token space.
-        action_tokens = self.input_proj(x)  # [B, Ta, d_model]
-
-        # add future action stage embedding
-        # Add stage-dependent features aligned with each future action token.
-        stage_feat = self._build_action_stage_feat(
-            stage=stage,
-            B=B,
-            Ta=Ta,
-            device=device,
-        )
-
-        action_tokens = action_tokens + stage_feat
-
-        # padding action token 置零
-        # Remove feature values from padded action tokens.
-        action_tokens = self._zero_padded_tokens(
-            action_tokens,
-            action_padding_mask,
-        )
-
-        # action positional embedding
-        # Inject future action timestep information.
-        action_tokens = self.action_pos_emb(action_tokens)
-
-        # ------------------------------------------------------------
-        # 3. decoder: action tokens cross-attend to cond memory
-        # ------------------------------------------------------------
-
-        # Decode noisy action tokens while cross-attending to observation memory.
-        action_tokens = self.action_decoder(
-            tgt=action_tokens,
-            memory=memory,
-            tgt_key_padding_mask=action_padding_mask,
-            memory_key_padding_mask=obs_padding_mask,
-        )  # [B, Ta, d_model]
-
-        # Final feature normalization before prediction heads.
-        action_tokens = self.final_norm(action_tokens)
-
-        # ------------------------------------------------------------
-        # 4. output
-        # ------------------------------------------------------------
-
-        # Optional stage prediction for every action token.
-        stage_logits = self.stage_head(action_tokens)      # [B, Ta, num_stages]
-
-        # Predicted denoised action / diffusion output.
-        action_out = self.out_proj_layer(action_tokens)    # [B, Ta, action_dim]
-
-        # Return stage logits together with action prediction when requested.
-        if return_stage_logits:
-            return action_out, stage_logits
-
-        # Return one action prediction for every future timestep.
-        if mode == "sequence":
-            return action_out
-
-        # Aggregate the temporal action output into one global representation.
-        elif mode == "global":
-
-            # Simple mean pooling when no padding mask exists.
-            if action_padding_mask is None:
-                return action_out.mean(dim=1)
-
-            # Masked mean pooling over valid action timesteps.
-            valid = (~action_padding_mask).float().unsqueeze(-1)  # [B, Ta, 1]
-            denom = valid.sum(dim=1).clamp_min(1.0)
-            return (action_out * valid).sum(dim=1) / denom
-
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
+            for name in self.cameras_c
+        ]
+        #print(f"calvin skill env initialized") no respose, calvin skill is not instantialized
+    # 初始化 PyBullet 连接，支持 VR 共享内存、GUI、EGL 和普通无界面模式。
+    def initialize_bullet(self, bullet_time_step, render_width, render_height):
+        # 保存时间步相关配置；下方实际设置的仿真时间步长为 1 / self.bts。
+        self.bts = bullet_time_step
+        self.rhw = (render_height, render_width)
+        # 仅在尚未连接时创建客户端。
+        if not self.isConnected():
+            # 标记当前环境拥有该客户端，关闭时由本环境负责断开。
+            self.ownsPhysicsClient = True
+            # VR 模式：连接已有的共享内存物理服务，并开启实时仿真。
+            if self.use_vr:
+                self.p = bc.BulletClient(connection_mode=p.SHARED_MEMORY)
+                cid = self.p._client
+                if cid < 0:
+                    logger.error("Failed to connect to SHARED_MEMORY bullet server.\n" " Is it running?")
+                    sys.exit(1)
+                self.p.setRealTimeSimulation(enableRealTimeSimulation=1, physicsClientId=cid)
+            # GUI 模式：创建带可视化窗口的物理客户端。
+            elif self.show_gui:
+                self.p = bc.BulletClient(connection_mode=p.GUI)
+                cid = self.p._client
+                if cid < 0:
+                    logger.error("Failed to connect to GUI.")
+            # EGL 模式：创建无界面客户端，并加载 EGL 插件用于离屏渲染。
+            elif self.use_egl:
+                options = f"--width={self.rhw[1]} --height={self.rhw[0]}"
+                self.p = bc.BulletClient(p.DIRECT, options=options)
+                # 设置确定性的重叠物体配对选项。
+                self.p.setPhysicsEngineParameter(deterministicOverlappingPairs=1)
+                cid = self.p._client
+                # 关闭分割、深度和 RGB 调试预览。
+                self.p.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0, physicsClientId=cid)
