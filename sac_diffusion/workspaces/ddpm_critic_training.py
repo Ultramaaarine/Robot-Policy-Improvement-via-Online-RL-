@@ -113,7 +113,7 @@ class TrainDiffusionWorkspace(BaseWorkspace):
         # Build dataloaders for offline diffusion and critic training.
         self.training_dataloader = DataLoader(
             self.training_dataset,
-            num_workers=4,
+            num_workers=4,#可以换成别的数字
             batch_size=self.batch_size,
             shuffle=True
         )
@@ -306,7 +306,7 @@ class TrainDiffusionWorkspace(BaseWorkspace):
         analysis_dir = Path(self.log_dir) / "action_analysis"
         ds_stats = self._save_dataset_action_stats(self.training_dataset, analysis_dir)
 
-        np.random.seed(cfg.seed + 1234)
+        np.random.seed(cfg.seed + 1234)#这个随机种子+1234最好不要动
 
         # Prepare checkpoint output directory.
         model_path = Path(self.cfg.model_save_dir)
