@@ -1,3 +1,5 @@
+# This file is a Skilldatamodule class, collecting training data of specific skill from original dataset(.npz file in folder)
+# The collected data is provided to demon extraction script.(extract_demo.py)
 from typing import Dict
 from pathlib import Path
 import logging
