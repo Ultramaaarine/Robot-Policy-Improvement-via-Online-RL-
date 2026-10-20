@@ -24,15 +24,21 @@ git clone --recurse-submodules https://github.com/mees/calvin.git
 cd dataset
 sh download_data.sh D | ABC | ABCD | debug
 ```
-3. create conda environment
+3. download calvin environment
+```bash
+cd ..
+git clone --recursive https://github.com/mees/calvin_env.git
+```
+
+4. create conda environment
 ```bash
 conda create -n sacdiff_venv python = 3.12
 ```
-4. Activate conda environment
+5. Activate conda environment
 ```bash
 conda activate sacdiff_venv
 ```
-5. Install pytorch
+6. Install pytorch
 
   Attention: if you are in root path "SAC_Diffusion",skip command "cd ..". Make Sure you are in root path!!!
 ```bash
@@ -40,11 +46,11 @@ cd ..
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
   --index-url https://download.pytorch.org/whl/cu124
 ```
-6. Install other packages
+7. Install other packages
 ```bash
 pip install -r requirements.txt
 ```
-7. Run training script
+8. Run training script
 
   run DDPM training
 ```bash
