@@ -7,7 +7,7 @@ This repo is tested on a 24.04 Unbuntu machine
 1. Clone the repository:
 
 ```bash
-https://github.com/Ultramaaarine/Robot-Policy-Improvement-via-Online-RL-.git
+git clone https://github.com/Ultramaaarine/Robot-Policy-Improvement-via-Online-RL-.git
 cd SAC_Diffusion
 ```
 
